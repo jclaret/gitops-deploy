@@ -1,92 +1,83 @@
+#!/usr/bin/groovy
+
+// Load shared libraries from github jenkins-shared-libraries
+@Library('shared-library') _
+
+def appName = "sandbox"
+def microName = "maven"
+def agentLabel = "maven"
+def targetEnv = "dev"
+def cicdProject = "jenkins"
+def devProject = appName + "-" + targetEnv
+def imageName = appName + "-" + microName 
+def commitRef = ref.split('/')
+def releaseCommit = (commitRef[1] == "tags" ? true : false)
+
 pipeline {
-    environment {
-        DOMAIN='apps.cluster-gsvdk.gsvdk.sandbox209.opentlc.com'
-        PRJ="hello-${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
-        APP='nodeapp'
-    }
-    agent {
-      node {
-        label 'nodejs'
+  // If not specified because it's not relevant, start up a 'nodejs' agent by default
+  agent { label agentLabel.trim() ?: "nodejs" }
+
+  environment {
+    gitURL = "https://github.com/jclaret/gitops-deploy.git"
+  }
+
+  options {
+    ansiColor('xterm')
+    buildDiscarder(logRotator(numToKeepStr: '5'))
+    timeout(time: 30, unit: 'MINUTES')
+    skipDefaultCheckout(true)
+  }
+
+  stages {
+    stage ('Checkout SCM') {
+      steps {
+        checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[url: gitURL , credentialsId: gitKey ]], 
+                branches: [[name: ref]]], 
+                poll: false
+        sh 'echo "$ref" > ref.txt'
       }
     }
-    stages {
-        stage('create') {
-            steps {
-                script {
-                    // Uncomment to get lots of debugging output
-                    //openshift.logLevel(1)
-                    openshift.withCluster() {
-                        echo("Create project ${env.PRJ}") 
-                        openshift.newProject("${env.PRJ}")
-                        openshift.withProject("${env.PRJ}") {
-                            echo('Grant to developer read access to the project')
-                            openshift.raw('policy', 'add-role-to-user', 'view', 'developer')
-                            echo("Create app ${env.APP}") 
-                            openshift.newApp("${env.GIT_URL}#${env.BRANCH_NAME}", "--strategy source", "--name ${env.APP}")
-                        }
-                    }
-                }
+    input 'stop'
+    stage('Build Image') {
+      steps {
+        script {
+          // set environment variables to dev
+          setConfiguration(appName, devProject, imageName)
+          openshift.withCluster() {
+            openshift.withProject(cicdProject) {
+              def sb = openshift.selector("bc", imageName)
+                  .startBuild("--from-dir=.","--wait=true","--follow=true", "--build-loglevel=5")
             }
+          }
         }
-        stage('build') {
-            steps {
-                script {
-                    openshift.withCluster() {
-                        openshift.withProject("${env.PRJ}") {
-                            def bc = openshift.selector('bc', "${env.APP}")
-                            echo("Wait for build from bc ${env.APP} to finish") 
-                            timeout(5) {
-                                def builds = bc.related('builds').untilEach(1) {
-                                    def phase = it.object().status.phase
-                                    if (phase == "Failed" || phase == "Error" || phase == "Cancelled") {
-                                        error 'OpenShift build failed or was cancelled'
-                                    }
-                                    return (phase == "Complete")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        stage('deploy') {
-            steps {
-                script {
-                    openshift.withCluster() {
-                        openshift.withProject("${env.PRJ}") {
-                            echo("Expose route for service ${env.APP}") 
-                            // Default Jenkins settings to not allow to query properties of an object
-                            // So we cannot query the widlcard domain of the ingress controller
-                            // Nor the auto genereted host of a route
-                            openshift.expose("svc/${env.APP}", "--hostname ${env.PRJ}.${env.DOMAIN}")
-                            echo("Wait for deployment ${env.APP} to finish") 
-                            timeout(5) {
-                                openshift.selector('deployment', "${env.APP}").rollout().status()
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        stage('test') {
-            input {
-                message 'About to test the application'
-                ok 'Ok'
-            }
-            steps {
-                echo "Check that '${env.PRJ}.${env.DOMAIN}' returns HTTP 200"
-                sh "curl -s --fail ${env.PRJ}.${env.DOMAIN}"
-            }
-        }
+      }
     }
-    post {
-        always {
-            script {
-                openshift.withCluster() {
-                    echo("Delete project ${env.PRJ}") 
-                    openshift.delete("project/${env.PRJ}")
-                }
-            }
+    stage('Deploy') {
+      steps {
+        script {
+          deployImage(imageName, devProject)            
         }
+      }
     }
+    stage('Push to Quay') {
+      when {
+        beforeAgent true
+        expression { releaseCommit }
+      }
+      agent { label 'skopeo' }
+      steps {
+        script {
+          def versionTag = commitRef[2]
+          pushImageToQuay(devProject, imageName, versionTag)
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      // Clean up the workspace
+      cleanWs()
+    }
+  }
 }
